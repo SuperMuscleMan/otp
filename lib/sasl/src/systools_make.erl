@@ -975,7 +975,7 @@ check_modules(Appls, Path, TestP) ->
 	     Mod <- A#application.modules],
     case duplicates(M1) of
 	[] ->
-	    case check_mods(M1, Appls, Path, TestP) of
+	    case check_mods(Appls, Path, TestP) of
 		{error, Errors} ->
 		    throw({error, {modules, Errors}});
 		Return ->
@@ -991,8 +991,8 @@ check_modules(Appls, Path, TestP) ->
 %% Use the module extension of the running machine as extension for
 %% the checked modules.
 
-check_mods(Modules, Appls, Path, {SrcTestP, XrefP}) ->
-    SrcTestRes = check_src(Modules, Appls, Path, SrcTestP),
+check_mods(Appls, Path, {SrcTestP, XrefP}) ->
+    SrcTestRes = check_src(Appls, Path, SrcTestP, []),
     XrefRes = check_xref(Appls, Path, XrefP),
     Res = SrcTestRes ++ XrefRes,
     case filter(fun({error, _}) -> true;
@@ -1008,21 +1008,25 @@ check_mods(Modules, Appls, Path, {SrcTestP, XrefP}) ->
 	    {error, Errors}
     end.
 
-check_src(Modules, Appls, Path, true) ->
-    Ext = code:objfile_extension(),
-    IncPath = create_include_path(Appls, Path),
-    append(map(fun(ModT) ->
-		       {Mod,App,Dir} = ModT,
-		       case check_mod(Mod,App,Dir,Ext,IncPath) of
-			   ok ->
-			       [];
-			   {error, Error} ->
-			       [{error,{Error, ModT}}];
-			   {warning, Warn} ->
-			       [{warning,{Warn,ModT}}]
-		       end
-	       end,
-	       Modules));
+check_src([{{App, _Appv}, A} = H | T], Path, true, Result) ->
+	Ext = code:objfile_extension(),
+	Dir = A#application.dir,
+	Mods = A#application.modules,
+    IncPath = create_include_path([H], Path),
+	SrcPath = create_src_path(Dir),
+	Result1 = foldl(fun(Mod, Acc) ->
+		case check_mod(Mod,App,Dir,Ext,SrcPath,IncPath) of
+			ok ->
+				Acc;
+			{error, Error} ->
+				[{error, {Error, {Mod, App, Dir}}} | Acc];
+			{warning, Warn} ->
+				[{warning, {Warn, {Mod, App, Dir}}} | Acc]
+		end
+		  end, Result, Mods),
+	check_src(T, Path, true, Result1);
+check_src([], _Path, _SrcTestP, Result)->
+	Result;
 check_src(_, _, _, _) ->
     [].
 
@@ -1121,12 +1125,12 @@ exists_xref(Flag) ->
 	_          -> Flag
     end.
 
-check_mod(Mod,App,Dir,Ext,IncPath) ->
+check_mod(Mod,App,Dir,Ext,SrcPath,IncPath) ->
     ObjFile = mod_to_filename(Dir, Mod, Ext),
     case file:read_file_info(ObjFile) of
 	{ok,FileInfo} ->
 	    LastModTime = FileInfo#file_info.mtime,
-	    check_module(Mod, Dir, LastModTime, IncPath);
+	    check_module(Mod, LastModTime, SrcPath, IncPath);
 	_ ->
 	    {error, {module_not_found, App, Mod}}
     end.
@@ -1134,9 +1138,8 @@ check_mod(Mod,App,Dir,Ext,IncPath) ->
 mod_to_filename(Dir, Mod, Ext) ->
     filename:join(Dir, atom_to_list(Mod) ++ Ext).
 
-check_module(Mod, Dir, ObjModTime, IncPath) ->
-    {SrcDirs,_IncDirs}= smart_guess(Dir,IncPath),
-    case locate_src(Mod,SrcDirs) of
+check_module(Mod, ObjModTime, SrcPath, _IncPath) ->
+    case locate_src(Mod,SrcPath) of
 	{ok,_FDir,_File,LastModTime} ->
 	    if
 		LastModTime > ObjModTime ->
@@ -1161,22 +1164,8 @@ locate_src(_,[]) ->
     false.
 
 
-%%______________________________________________________________________
-%% smart_guess(Mod, Dir,IncludePath) -> {[Dirs],[IncDirs]}
-%% Guess the src code and include directory. If dir contains .../ebin
-%% src-dir should be one of .../src or .../src/e_src
-%% If dir does not contain .../ebin set dir to the same directory.
 
-smart_guess(Dir,IncPath) ->
-    case reverse(filename:split(Dir)) of
-	["ebin"|D] ->
-	    D1 = reverse(D),
-	    Dirs = [filename:join(D1 ++ ["src"]),
-		    filename:join(D1 ++ ["src", "e_src"])],
-	    {Dirs,Dirs ++ IncPath};
-	_ ->
-	    {[Dir],[Dir] ++ IncPath}
-    end.
+	
 
 %%______________________________________________________________________
 %% generate_script(#release, 
@@ -1254,7 +1243,7 @@ valid_variables(_) ->
 rm_tlsl(P) -> rm_tlsl1(reverse(P)).
 rm_tlsl1([$/|P]) -> rm_tlsl1(P);
 rm_tlsl1(P) -> reverse(P).
-  
+
 %%______________________________________________________________________
 %% Start all applications.
 %% Do not start applications that are included applications !
@@ -1323,7 +1312,7 @@ sort_appls([{N, A}|T], Missing, Circular, Visited) ->
 				   T1, Visited, [], []),
     Missing1 = NotFnd1 ++ NotFnd2 ++ Missing,
     case Uses ++ Incs of
-	[] -> 
+	[] ->
 	    %% No more app that must be started before this one is
 	    %% found; they are all already taken care of (and present
 	    %% in Visited list)
@@ -2112,6 +2101,32 @@ no_dupl([Dir|Path], FoundAppDirs) ->
     end;
 no_dupl([], _) ->
     [].
+
+%% Guess the src code directory. If dir contains .../ebin
+%% src-dir should be one of .../src or .../src/* or .../src/*/*
+%% If dir does not contain .../ebin set dir to the same directory.
+
+create_src_path(Dir)->
+	case reverse(filename:split(Dir)) of
+		["ebin"|D] ->
+			D1 = filename:join(reverse(D)),
+			create_src_path(["src"], D1, []);
+		_ ->
+			[Dir]
+	end.
+create_src_path([H | T], ParentDir, Result)->
+	Dir = filename:join(ParentDir, H),
+	case filelib:is_dir(Dir) of
+		true ->
+			{ok, ListDir} = file:list_dir(Dir),
+			Result1 = create_src_path(ListDir, Dir, Result),
+			create_src_path(T, ParentDir, [Dir | Result1]);
+		_ ->
+			create_src_path(T, ParentDir, Result)
+	end;
+create_src_path([], _ParentDir, Result) ->
+	Result.
+
 
 is_app_type(permanent) -> true;
 is_app_type(transient) -> true;
